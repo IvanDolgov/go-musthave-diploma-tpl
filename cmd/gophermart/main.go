@@ -14,6 +14,7 @@ import (
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/logger"
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/middleware"
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/models"
+	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/storage"
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/storage/postgres"
 	"github.com/go-chi/chi/v5"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -22,7 +23,7 @@ import (
 
 // run запускает приложение с переданной конфигурацией
 func run(cfg models.Config) error {
-	var dbStorage postgres.DatabaseStorage
+	var dbStorage storage.DatabaseStorage
 
 	// Создаем корневой контекст
 	ctx := context.Background()

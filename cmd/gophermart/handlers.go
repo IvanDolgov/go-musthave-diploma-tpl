@@ -1,45 +1,43 @@
 package main
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"time"
 
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/auth"
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/middleware"
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/models"
-	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/storage/postgres"
+	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/storage"
 	"golang.org/x/crypto/bcrypt"
 )
 
-// checkConnectDatabase проверяет подключение к базе данных
-func checkConnectDatabase(dbStorage postgres.DatabaseStorage) http.HandlerFunc {
-	return func(w http.ResponseWriter, req *http.Request) {
-		if dbStorage == nil {
-			w.Header().Set("Content-Type", "text/plain")
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("Database not configured - using in-memory storage"))
-			return
-		}
+// // checkConnectDatabase проверяет подключение к базе данных
+// func checkConnectDatabase(dbStorage storage.DatabaseStorage) http.HandlerFunc {
+//     return func(w http.ResponseWriter, req *http.Request) {
+//         if dbStorage == nil {
+//             w.Header().Set("Content-Type", "text/plain")
+//             w.WriteHeader(http.StatusOK)
+//             w.Write([]byte("Database not configured - using in-memory storage"))
+//             return
+//         }
 
-		ctx, cancel := context.WithTimeout(req.Context(), 5*time.Second)
-		defer cancel()
+//         ctx, cancel := context.WithTimeout(req.Context(), 5*time.Second)
+//         defer cancel()
 
-		if err := dbStorage.Ping(ctx); err != nil {
-			http.Error(w, "Database connection failed", http.StatusInternalServerError)
-			return
-		}
+//         if err := dbStorage.Ping(ctx); err != nil {
+//             http.Error(w, "Database connection failed", http.StatusInternalServerError)
+//             return
+//         }
 
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Database connection successful"))
-	}
-}
+//         w.WriteHeader(http.StatusOK)
+//         w.Write([]byte("Database connection successful"))
+//     }
+// }
 
 // registrationUsers обрабатывает регистрацию пользователя
-func registrationUsers(dbStorage postgres.Storage) http.HandlerFunc {
+func registrationUsers(dbStorage storage.Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Проверяем метод запроса
 		if r.Method != http.MethodPost {
@@ -71,9 +69,7 @@ func registrationUsers(dbStorage postgres.Storage) http.HandlerFunc {
 
 		// Проверяем существование пользователя
 		ctx := r.Context()
-		exists, err := dbStorage.(interface {
-			UserExists(ctx context.Context, login string) (bool, error)
-		}).UserExists(ctx, req.Login)
+		exists, err := dbStorage.UserExists(ctx, req.Login)
 
 		if err != nil {
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -93,9 +89,7 @@ func registrationUsers(dbStorage postgres.Storage) http.HandlerFunc {
 		}
 
 		// Создаем пользователя
-		err = dbStorage.(interface {
-			CreateUser(ctx context.Context, login, hashedPassword string) error
-		}).CreateUser(ctx, req.Login, string(hashedPassword))
+		err = dbStorage.CreateUser(ctx, req.Login, string(hashedPassword))
 
 		if err != nil {
 			// Проверяем ошибку на конфликт
@@ -108,9 +102,7 @@ func registrationUsers(dbStorage postgres.Storage) http.HandlerFunc {
 		}
 
 		// Получаем созданного пользователя
-		user, err := dbStorage.(interface {
-			GetUserByLogin(ctx context.Context, login string) (models.User, error)
-		}).GetUserByLogin(ctx, req.Login)
+		user, err := dbStorage.GetUserByLogin(ctx, req.Login)
 
 		if err != nil {
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -138,7 +130,7 @@ func registrationUsers(dbStorage postgres.Storage) http.HandlerFunc {
 }
 
 // authUsers обрабатывает аутентификацию пользователя
-func authUsers(dbStorage postgres.Storage) http.HandlerFunc {
+func authUsers(dbStorage storage.Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Проверяем метод запроса
 		if r.Method != http.MethodPost {
@@ -171,9 +163,7 @@ func authUsers(dbStorage postgres.Storage) http.HandlerFunc {
 		ctx := r.Context()
 
 		// Получаем пользователя
-		user, err := dbStorage.(interface {
-			GetUserByLogin(ctx context.Context, login string) (models.User, error)
-		}).GetUserByLogin(ctx, req.Login)
+		user, err := dbStorage.GetUserByLogin(ctx, req.Login)
 
 		if err != nil {
 			if err == sql.ErrNoRows {
