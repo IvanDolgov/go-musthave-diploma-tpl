@@ -1,8 +1,10 @@
 package middleware
 
 import (
+	"bufio"
 	"bytes"
 	"io"
+	"net"
 	"net/http"
 
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/hash"
@@ -52,42 +54,66 @@ func HashResponse(key string) func(http.Handler) http.Handler {
 				return
 			}
 
-			// Используем custom ResponseWriter для перехвата ответа
-			hw := &hashResponseWriter{ResponseWriter: w, key: key}
-			next.ServeHTTP(hw, r)
+			// Используем буферизированный writer
+			h := &bufferedHashWriter{
+				ResponseWriter: w,
+				key:            key,
+				buffer:         &bytes.Buffer{},
+				headers:        make(http.Header),
+				statusCode:     200, // Значение по умолчанию
+			}
 
-			// Вычисляем хеш и добавляем в заголовок
-			if hw.buffer.Len() > 0 {
-				hashValue := hash.ComputeHMACSHA256(hw.buffer.Bytes(), key)
+			// Запускаем обработку
+			next.ServeHTTP(h, r)
+
+			// Вычисляем и добавляем хеш
+			if h.buffer.Len() > 0 {
+				hashValue := hash.ComputeHMACSHA256(h.buffer.Bytes(), h.key)
 				if hashValue != "" {
-					w.Header().Set("HashSHA256", hashValue)
+					h.headers.Set("HashSHA256", hashValue)
 				}
 			}
+
+			// Копируем все заголовки в оригинальный writer
+			for k, v := range h.headers {
+				w.Header()[k] = v
+			}
+
+			// Отправляем статус код
+			w.WriteHeader(h.statusCode)
+
+			// Отправляем данные
+			h.buffer.WriteTo(w)
 		})
 	}
 }
 
-// hashResponseWriter перехватывает запись ответа для вычисления хеша
-type hashResponseWriter struct {
+// bufferedHashWriter полностью буферизирует ответ перед отправкой
+type bufferedHashWriter struct {
 	http.ResponseWriter
-	key    string
-	buffer bytes.Buffer
+	key        string
+	buffer     *bytes.Buffer
+	headers    http.Header
+	statusCode int
 }
 
-func (hw *hashResponseWriter) Write(b []byte) (int, error) {
-	// Сохраняем данные для вычисления хеша
-	hw.buffer.Write(b)
-	return hw.ResponseWriter.Write(b)
+func (h *bufferedHashWriter) Header() http.Header {
+	return h.headers
 }
 
-// Важно: перехватываем WriteHeader чтобы успеть вычислить хеш до отправки заголовков
-func (hw *hashResponseWriter) WriteHeader(statusCode int) {
-	// Вычисляем хеш перед отправкой заголовков
-	if hw.buffer.Len() > 0 {
-		hashValue := hash.ComputeHMACSHA256(hw.buffer.Bytes(), hw.key)
-		if hashValue != "" {
-			hw.ResponseWriter.Header().Set("HashSHA256", hashValue)
-		}
+func (h *bufferedHashWriter) Write(b []byte) (int, error) {
+	return h.buffer.Write(b)
+}
+
+func (h *bufferedHashWriter) WriteHeader(statusCode int) {
+	h.statusCode = statusCode
+}
+
+// Hijack поддерживает WebSocket и другие протоколы
+func (h *bufferedHashWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	// Для хижака не используем буферизацию
+	if hj, ok := h.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
 	}
-	hw.ResponseWriter.WriteHeader(statusCode)
+	return nil, nil, http.ErrNotSupported
 }
