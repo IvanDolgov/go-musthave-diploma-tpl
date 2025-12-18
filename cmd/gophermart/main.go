@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/auth"
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/config"
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/logger"
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/middleware"
@@ -44,6 +45,20 @@ func run(cfg models.Config) error {
 	dbStorage = pgStorage
 	defer pgStorage.Close()
 
+	// Создаем JWTManager с секретным ключом из конфигурации
+	// Используем ключ из конфигурации или дефолтный
+	jwtSecret := cfg.Key
+	if jwtSecret == "" {
+		jwtSecret = "your-secret-key-change-in-production"
+		logger.Log.Warn("Using default JWT secret key, set -k flag for production")
+	}
+
+	jwtManager := auth.NewJWTManager(jwtSecret)
+	logger.Log.Info("JWT manager initialized")
+
+	// Создаем хендлеры аутентификации
+	authHandlers := NewAuthHandlers(store, jwtManager)
+
 	// создаем строку с сервером
 	fullPathServer := buildServerAddress(cfg.Server, cfg.Port)
 
@@ -60,13 +75,15 @@ func run(cfg models.Config) error {
 	// Middleware для добавления хеша в исходящие ответы
 	router.Use(middleware.HashResponse(cfg.Key))
 
-	router.Use(middleware.AuthMiddleware)
+	// Middleware аутентификации
+	router.Use(middleware.NewAuthMiddleware(jwtManager))
 
-	router.Post(`/api/user/register`, registrationUsers(store))
-	router.Post(`/api/user/register/`, registrationUsers(store))
+	// Регистрация маршрутов
+	router.Post(`/api/user/register`, authHandlers.registrationUsers())
+	router.Post(`/api/user/register/`, authHandlers.registrationUsers())
 
-	router.Post(`/api/user/login`, authUsers(store))
-	router.Post(`/api/user/login/`, authUsers(store))
+	router.Post(`/api/user/login`, authHandlers.authUsers())
+	router.Post(`/api/user/login/`, authHandlers.authUsers())
 
 	// HTTP сервер
 	server := &http.Server{

@@ -36,8 +36,22 @@ import (
 //     }
 // }
 
+// AuthHandlers содержит зависимости для хендлеров аутентификации
+type AuthHandlers struct {
+	storage storage.Storage
+	jwt     *auth.JWTManager
+}
+
+// NewAuthHandlers создает новый экземпляр AuthHandlers
+func NewAuthHandlers(storage storage.Storage, jwt *auth.JWTManager) *AuthHandlers {
+	return &AuthHandlers{
+		storage: storage,
+		jwt:     jwt,
+	}
+}
+
 // registrationUsers обрабатывает регистрацию пользователя
-func registrationUsers(dbStorage storage.Storage) http.HandlerFunc {
+func (h *AuthHandlers) registrationUsers() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Проверяем метод запроса
 		if r.Method != http.MethodPost {
@@ -69,7 +83,7 @@ func registrationUsers(dbStorage storage.Storage) http.HandlerFunc {
 
 		// Проверяем существование пользователя
 		ctx := r.Context()
-		exists, err := dbStorage.UserExists(ctx, req.Login)
+		exists, err := h.storage.UserExists(ctx, req.Login)
 
 		if err != nil {
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -89,7 +103,7 @@ func registrationUsers(dbStorage storage.Storage) http.HandlerFunc {
 		}
 
 		// Создаем пользователя
-		err = dbStorage.CreateUser(ctx, req.Login, string(hashedPassword))
+		err = h.storage.CreateUser(ctx, req.Login, string(hashedPassword))
 
 		if err != nil {
 			// Проверяем ошибку на конфликт
@@ -102,7 +116,7 @@ func registrationUsers(dbStorage storage.Storage) http.HandlerFunc {
 		}
 
 		// Получаем созданного пользователя
-		user, err := dbStorage.GetUserByLogin(ctx, req.Login)
+		user, err := h.storage.GetUserByLogin(ctx, req.Login)
 
 		if err != nil {
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -110,7 +124,7 @@ func registrationUsers(dbStorage storage.Storage) http.HandlerFunc {
 		}
 
 		// Создаем JWT токен
-		token, err := auth.CreateToken(user.ID, user.Login)
+		token, err := h.jwt.CreateToken(user.ID, user.Login)
 		if err != nil {
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
@@ -130,7 +144,7 @@ func registrationUsers(dbStorage storage.Storage) http.HandlerFunc {
 }
 
 // authUsers обрабатывает аутентификацию пользователя
-func authUsers(dbStorage storage.Storage) http.HandlerFunc {
+func (h *AuthHandlers) authUsers() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Проверяем метод запроса
 		if r.Method != http.MethodPost {
@@ -163,7 +177,7 @@ func authUsers(dbStorage storage.Storage) http.HandlerFunc {
 		ctx := r.Context()
 
 		// Получаем пользователя
-		user, err := dbStorage.GetUserByLogin(ctx, req.Login)
+		user, err := h.storage.GetUserByLogin(ctx, req.Login)
 
 		if err != nil {
 			if err == sql.ErrNoRows {
@@ -182,7 +196,7 @@ func authUsers(dbStorage storage.Storage) http.HandlerFunc {
 		}
 
 		// Создаем JWT токен
-		token, err := auth.CreateToken(user.ID, user.Login)
+		token, err := h.jwt.CreateToken(user.ID, user.Login)
 		if err != nil {
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return

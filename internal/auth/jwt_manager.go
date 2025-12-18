@@ -6,8 +6,17 @@ import (
     "github.com/golang-jwt/jwt/v4"
 )
 
-// JWTSecretKey - секретный ключ для JWT токенов
-var JWTSecretKey = []byte("your-secret-key-change-in-production")
+// JWTManager управляет созданием и проверкой JWT токенов
+type JWTManager struct {
+    secretKey []byte
+}
+
+// NewJWTManager создает новый JWTManager с секретным ключом
+func NewJWTManager(secretKey string) *JWTManager {
+    return &JWTManager{
+        secretKey: []byte(secretKey),
+    }
+}
 
 // Claims представляет JWT claims
 type Claims struct {
@@ -17,7 +26,7 @@ type Claims struct {
 }
 
 // CreateToken создает JWT токен для пользователя
-func CreateToken(userID int, login string) (string, error) {
+func (m *JWTManager) CreateToken(userID int, login string) (string, error) {
     expirationTime := time.Now().Add(24 * time.Hour)
     
     claims := &Claims{
@@ -31,15 +40,15 @@ func CreateToken(userID int, login string) (string, error) {
     }
 
     token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-    return token.SignedString(JWTSecretKey)
+    return token.SignedString(m.secretKey)
 }
 
 // VerifyToken проверяет JWT токен
-func VerifyToken(tokenString string) (*Claims, error) {
+func (m *JWTManager) VerifyToken(tokenString string) (*Claims, error) {
     claims := &Claims{}
     
     token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
-        return JWTSecretKey, nil
+        return m.secretKey, nil
     })
     
     if err != nil {
