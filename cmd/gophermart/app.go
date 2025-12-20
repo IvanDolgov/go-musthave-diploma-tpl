@@ -357,6 +357,10 @@ func (a *App) checkOrderStatus(ctx context.Context, orderNumber string) error {
 
 	url := fmt.Sprintf("%s/api/orders/%s", a.config.AccrualSystemAddress, orderNumber)
 
+	a.logger.Debug("Checking accrual status",
+		zap.String("order_number", orderNumber),
+		zap.String("url", url))
+
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
@@ -371,6 +375,10 @@ func (a *App) checkOrderStatus(ctx context.Context, orderNumber string) error {
 	}
 	defer resp.Body.Close()
 
+	a.logger.Debug("Accrual response received",
+		zap.String("order_number", orderNumber),
+		zap.Int("status_code", resp.StatusCode))
+
 	switch resp.StatusCode {
 	case http.StatusOK:
 		var accrualResp models.AccrualResponse
@@ -379,9 +387,30 @@ func (a *App) checkOrderStatus(ctx context.Context, orderNumber string) error {
 			return fmt.Errorf("failed to read response body: %w", err)
 		}
 
+		a.logger.Debug("Accrual response body",
+			zap.String("order_number", orderNumber),
+			zap.String("body", string(body)))
+
 		if err := json.Unmarshal(body, &accrualResp); err != nil {
 			return fmt.Errorf("failed to decode response: %w", err)
 		}
+
+		a.logger.Info("Accrual response details",
+			zap.String("order_number", orderNumber),
+			zap.String("status", accrualResp.Status),
+			zap.Bool("accrual_is_nil", accrualResp.Accrual == nil),
+			zap.Float64("accrual_value", func() float64 {
+				if accrualResp.Accrual != nil {
+					return *accrualResp.Accrual
+				}
+				return 0
+			}()),
+			zap.Bool("should_add_to_balance", accrualResp.Status == "PROCESSED" && accrualResp.Accrual != nil && *accrualResp.Accrual > 0))
+
+		a.logger.Debug("Accrual response parsed",
+			zap.String("order_number", orderNumber),
+			zap.String("status", accrualResp.Status),
+			zap.Any("accrual", accrualResp.Accrual))
 
 		// Обновляем статус заказа в базе данных
 		err = a.storage.UpdateOrderAccrual(ctx, orderNumber, accrualResp.Status, accrualResp.Accrual)
@@ -391,16 +420,39 @@ func (a *App) checkOrderStatus(ctx context.Context, orderNumber string) error {
 
 		// Если есть начисления, обновляем баланс
 		if accrualResp.Status == "PROCESSED" && accrualResp.Accrual != nil && *accrualResp.Accrual > 0 {
+			a.logger.Info("Adding accrual to balance",
+				zap.String("order_number", orderNumber),
+				zap.Float64("accrual", *accrualResp.Accrual))
+
 			// Получаем userID по номеру заказа
 			order, err := a.storage.GetOrderByNumber(ctx, orderNumber)
 			if err != nil || order == nil {
 				return fmt.Errorf("failed to get order: %w", err)
 			}
 
+			a.logger.Info("Found order for user",
+				zap.String("order_number", orderNumber),
+				zap.Int("user_id", order.UserID))
+
 			err = a.storage.AddAccrualToBalance(ctx, order.UserID, *accrualResp.Accrual)
 			if err != nil {
+				a.logger.Error("Failed to add accrual to balance",
+					zap.String("order_number", orderNumber),
+					zap.Int("user_id", order.UserID),
+					zap.Float64("accrual", *accrualResp.Accrual),
+					zap.Error(err))
 				return fmt.Errorf("failed to add accrual to balance: %w", err)
 			}
+
+			a.logger.Info("Successfully added accrual to balance",
+				zap.String("order_number", orderNumber),
+				zap.Int("user_id", order.UserID),
+				zap.Float64("accrual", *accrualResp.Accrual))
+		} else {
+			a.logger.Debug("No accrual to add",
+				zap.String("order_number", orderNumber),
+				zap.String("status", accrualResp.Status),
+				zap.Any("accrual", accrualResp.Accrual))
 		}
 
 		// Если заказ еще в обработке, возвращаем ошибку для продолжения опроса
@@ -412,6 +464,8 @@ func (a *App) checkOrderStatus(ctx context.Context, orderNumber string) error {
 
 	case http.StatusNoContent:
 		// Заказ не найден в системе accrual
+		a.logger.Info("Order not found in accrual system",
+			zap.String("order_number", orderNumber))
 		err := a.storage.UpdateOrderAccrual(ctx, orderNumber, "INVALID", nil)
 		if err != nil {
 			return fmt.Errorf("failed to mark order as invalid: %w", err)

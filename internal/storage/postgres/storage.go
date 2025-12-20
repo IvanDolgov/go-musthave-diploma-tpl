@@ -9,16 +9,19 @@ import (
 	"time"
 
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/error/pgerrors"
+	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/logger"
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/models"
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/retry"
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/storage"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"go.uber.org/zap"
 )
 
 // PostgresStorage реализация Storage для PostgreSQL
 type PostgresStorage struct {
 	db         *sql.DB
 	classifier retry.ErrorClassifier
+	logger     *zap.Logger
 }
 
 // Проверка что PostgresStorage реализует все интерфейсы
@@ -54,6 +57,7 @@ func NewPostgresStorage(ctx context.Context, connectionString string) (storage.S
 	return &PostgresStorage{
 		db:         db,
 		classifier: pgerrors.NewPostgresErrorClassifier(),
+		logger:     logger.Log,
 	}, nil
 }
 
@@ -225,7 +229,7 @@ func (s *PostgresStorage) GetOrderByNumber(ctx context.Context, number string) (
 	`
 
 	var order models.Order
-	var accrual sql.NullFloat64 // Используем NullFloat64
+	var accrual sql.NullFloat64
 	var processedAt sql.NullTime
 
 	err := s.db.QueryRowContext(ctx, query, number).Scan(
@@ -353,10 +357,17 @@ func (s *PostgresStorage) GetBalance(ctx context.Context, userID int) (*models.B
 	return &balance, nil
 }
 
-// AddAccrualToBalance добавляет начисления к балансу через транзакцию
+// AddAccrualToBalance добавляет начисления к балансу
 func (s *PostgresStorage) AddAccrualToBalance(ctx context.Context, userID int, accrual float64) error {
+	s.logger.Info("Adding accrual to balance",
+		zap.Int("user_id", userID),
+		zap.Float64("accrual", accrual))
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		s.logger.Error("Failed to begin transaction",
+			zap.Int("user_id", userID),
+			zap.Error(err))
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
@@ -364,19 +375,35 @@ func (s *PostgresStorage) AddAccrualToBalance(ctx context.Context, userID int, a
 	// Конвертируем accrual в decimal строку
 	accrualStr := strconv.FormatFloat(accrual, 'f', 2, 64)
 
+	s.logger.Debug("Updating balance",
+		zap.Int("user_id", userID),
+		zap.String("accrual_str", accrualStr))
+
 	// Обновляем баланс (добавляем к current)
-	_, err = tx.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, `
 		UPDATE balances
 		SET current = current + $1::DECIMAL, updated_at = CURRENT_TIMESTAMP
 		WHERE user_id = $2
 	`, accrualStr, userID)
 
 	if err != nil {
+		s.logger.Error("Failed to update balance",
+			zap.Int("user_id", userID),
+			zap.Error(err))
 		return fmt.Errorf("failed to update balance: %w", err)
 	}
 
+	rowsAffected, _ := result.RowsAffected()
+	s.logger.Debug("Balance updated",
+		zap.Int("user_id", userID),
+		zap.Int64("rows_affected", rowsAffected))
+
 	// Создаем транзакцию (положительная сумма - приход)
 	referenceID := fmt.Sprintf("accrual_%d_%d", userID, time.Now().UnixNano())
+	s.logger.Debug("Creating transaction",
+		zap.Int("user_id", userID),
+		zap.String("reference_id", referenceID))
+
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO transactions (
 			user_id, type, amount, description, reference_id, status, processed_at
@@ -384,10 +411,27 @@ func (s *PostgresStorage) AddAccrualToBalance(ctx context.Context, userID int, a
 	`, userID, accrualStr, "Accrual from order processing", referenceID)
 
 	if err != nil {
+		s.logger.Error("Failed to create transaction",
+			zap.Int("user_id", userID),
+			zap.Error(err))
 		return fmt.Errorf("failed to create transaction: %w", err)
 	}
 
-	return tx.Commit()
+	s.logger.Debug("Committing transaction",
+		zap.Int("user_id", userID))
+
+	if err := tx.Commit(); err != nil {
+		s.logger.Error("Failed to commit transaction",
+			zap.Int("user_id", userID),
+			zap.Error(err))
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	s.logger.Info("Successfully added accrual to balance",
+		zap.Int("user_id", userID),
+		zap.Float64("accrual", accrual))
+
+	return nil
 }
 
 // CreateWithdrawal создает списание через транзакцию
