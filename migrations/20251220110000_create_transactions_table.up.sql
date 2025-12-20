@@ -1,9 +1,9 @@
--- Таблица для хранения транзакций
+-- Таблица для хранения транзакций (дебет/кредит)
 CREATE TABLE IF NOT EXISTS transactions (
     id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     type VARCHAR(50) NOT NULL,
-    amount DECIMAL(10, 2) NOT NULL,
+    amount DECIMAL(12, 2) NOT NULL, -- Отрицательные значения для расходов
     description TEXT,
     order_number VARCHAR(255),
     reference_id VARCHAR(255) UNIQUE,

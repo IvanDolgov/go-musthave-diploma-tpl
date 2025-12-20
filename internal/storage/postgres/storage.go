@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/error/pgerrors"
@@ -188,6 +189,33 @@ func (s *PostgresStorage) CreateOrder(ctx context.Context, userID int, orderNumb
 	return nil
 }
 
+// UpdateOrderAccrual обновляет статус и начисления заказа
+func (s *PostgresStorage) UpdateOrderAccrual(ctx context.Context, number string, status string, accrual *float64) error {
+	query := `
+		UPDATE orders
+		SET status = $1, accrual = $2, processed_at = $3, updated_at = CURRENT_TIMESTAMP
+		WHERE number = $4
+	`
+
+	var accrualValue interface{}
+	var processedAt interface{}
+
+	if accrual != nil {
+		accrualValue = *accrual
+		processedAt = time.Now()
+	} else {
+		accrualValue = nil
+		processedAt = nil
+	}
+
+	_, err := s.db.ExecContext(ctx, query, status, accrualValue, processedAt, number)
+	if err != nil {
+		return fmt.Errorf("failed to update order accrual: %w", err)
+	}
+
+	return nil
+}
+
 // GetOrderByNumber возвращает заказ по номеру
 func (s *PostgresStorage) GetOrderByNumber(ctx context.Context, number string) (*models.Order, error) {
 	query := `
@@ -197,7 +225,7 @@ func (s *PostgresStorage) GetOrderByNumber(ctx context.Context, number string) (
 	`
 
 	var order models.Order
-	var accrual sql.NullFloat64
+	var accrual sql.NullFloat64 // Используем NullFloat64
 	var processedAt sql.NullTime
 
 	err := s.db.QueryRowContext(ctx, query, number).Scan(
@@ -211,7 +239,7 @@ func (s *PostgresStorage) GetOrderByNumber(ctx context.Context, number string) (
 	)
 
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to get order by number: %w", err)
@@ -283,33 +311,6 @@ func (s *PostgresStorage) GetOrdersByUserID(ctx context.Context, userID int) ([]
 	return orders, nil
 }
 
-// UpdateOrderAccrual обновляет статус и начисления заказа
-func (s *PostgresStorage) UpdateOrderAccrual(ctx context.Context, number string, status string, accrual *float64) error {
-	query := `
-		UPDATE orders
-		SET status = $1, accrual = $2, processed_at = $3, updated_at = CURRENT_TIMESTAMP
-		WHERE number = $4
-	`
-
-	var accrualValue interface{}
-	var processedAt interface{}
-
-	if accrual != nil {
-		accrualValue = *accrual
-		processedAt = time.Now()
-	} else {
-		accrualValue = nil
-		processedAt = nil
-	}
-
-	_, err := s.db.ExecContext(ctx, query, status, accrualValue, processedAt, number)
-	if err != nil {
-		return fmt.Errorf("failed to update order accrual: %w", err)
-	}
-
-	return nil
-}
-
 // GetBalance возвращает баланс пользователя
 func (s *PostgresStorage) GetBalance(ctx context.Context, userID int) (*models.Balance, error) {
 	// Сначала создаем запись баланса, если ее нет
@@ -329,9 +330,10 @@ func (s *PostgresStorage) GetBalance(ctx context.Context, userID int) (*models.B
 	var balance models.Balance
 	balance.UserID = userID
 
+	var current, withdrawn sql.NullFloat64
 	err := s.db.QueryRowContext(ctx, query, userID).Scan(
-		&balance.Current,
-		&balance.Withdrawn,
+		&current,
+		&withdrawn,
 	)
 
 	if err != nil {
@@ -341,10 +343,17 @@ func (s *PostgresStorage) GetBalance(ctx context.Context, userID int) (*models.B
 		return nil, fmt.Errorf("failed to get balance: %w", err)
 	}
 
+	if current.Valid {
+		balance.Current = current.Float64
+	}
+	if withdrawn.Valid {
+		balance.Withdrawn = withdrawn.Float64
+	}
+
 	return &balance, nil
 }
 
-// AddAccrualToBalance добавляет начисления к балансу и создает транзакцию
+// AddAccrualToBalance добавляет начисления к балансу через транзакцию
 func (s *PostgresStorage) AddAccrualToBalance(ctx context.Context, userID int, accrual float64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -352,24 +361,27 @@ func (s *PostgresStorage) AddAccrualToBalance(ctx context.Context, userID int, a
 	}
 	defer tx.Rollback()
 
-	// Обновляем баланс
+	// Конвертируем accrual в decimal строку
+	accrualStr := strconv.FormatFloat(accrual, 'f', 2, 64)
+
+	// Обновляем баланс (добавляем к current)
 	_, err = tx.ExecContext(ctx, `
 		UPDATE balances
-		SET current = current + $1, updated_at = CURRENT_TIMESTAMP
+		SET current = current + $1::DECIMAL, updated_at = CURRENT_TIMESTAMP
 		WHERE user_id = $2
-	`, accrual, userID)
+	`, accrualStr, userID)
 
 	if err != nil {
 		return fmt.Errorf("failed to update balance: %w", err)
 	}
 
-	// Создаем транзакцию
+	// Создаем транзакцию (положительная сумма - приход)
 	referenceID := fmt.Sprintf("accrual_%d_%d", userID, time.Now().UnixNano())
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO transactions (
 			user_id, type, amount, description, reference_id, status, processed_at
 		) VALUES ($1, 'ACCRUAL', $2, $3, $4, 'COMPLETED', CURRENT_TIMESTAMP)
-	`, userID, accrual, "Accrual from order processing", referenceID)
+	`, userID, accrualStr, "Accrual from order processing", referenceID)
 
 	if err != nil {
 		return fmt.Errorf("failed to create transaction: %w", err)
@@ -378,7 +390,7 @@ func (s *PostgresStorage) AddAccrualToBalance(ctx context.Context, userID int, a
 	return tx.Commit()
 }
 
-// CreateWithdrawal создает запись о списании и транзакцию
+// CreateWithdrawal создает списание через транзакцию
 func (s *PostgresStorage) CreateWithdrawal(ctx context.Context, userID int, orderNumber string, sum float64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -386,14 +398,19 @@ func (s *PostgresStorage) CreateWithdrawal(ctx context.Context, userID int, orde
 	}
 	defer tx.Rollback()
 
-	// Проверяем, достаточно ли средств
-	var currentBalance float64
+	// Конвертируем сумму в decimal строку
+	sumStr := strconv.FormatFloat(sum, 'f', 2, 64)
+
+	// Проверяем, достаточно ли средств (current >= sum)
+	var currentBalance string
 	err = tx.QueryRowContext(ctx, "SELECT current FROM balances WHERE user_id = $1 FOR UPDATE", userID).Scan(&currentBalance)
 	if err != nil {
 		return fmt.Errorf("failed to get balance for update: %w", err)
 	}
 
-	if currentBalance < sum {
+	// Проверяем через decimal сравнение
+	currentFloat, _ := strconv.ParseFloat(currentBalance, 64)
+	if currentFloat < sum {
 		return fmt.Errorf("insufficient funds")
 	}
 
@@ -408,30 +425,33 @@ func (s *PostgresStorage) CreateWithdrawal(ctx context.Context, userID int, orde
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO withdrawals (user_id, order_number, sum)
 		VALUES ($1, $2, $3)
-	`, userID, orderNumber, sum)
+	`, userID, orderNumber, sumStr)
 
 	if err != nil {
 		return fmt.Errorf("failed to create withdrawal: %w", err)
 	}
 
-	// Обновляем баланс
+	// Обновляем баланс: уменьшаем current, увеличиваем withdrawn
 	_, err = tx.ExecContext(ctx, `
 		UPDATE balances
-		SET current = current - $1, withdrawn = withdrawn + $1, updated_at = CURRENT_TIMESTAMP
+		SET current = current - $1::DECIMAL, 
+		    withdrawn = withdrawn + $1::DECIMAL, 
+		    updated_at = CURRENT_TIMESTAMP
 		WHERE user_id = $2
-	`, sum, userID)
+	`, sumStr, userID)
 
 	if err != nil {
 		return fmt.Errorf("failed to update balance: %w", err)
 	}
 
-	// Создаем транзакцию
+	// Создаем транзакцию (отрицательная сумма - расход)
 	referenceID := fmt.Sprintf("withdraw_%s_%d", orderNumber, time.Now().UnixNano())
+	negativeSum := "-" + sumStr
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO transactions (
 			user_id, type, amount, description, order_number, reference_id, status, processed_at
 		) VALUES ($1, 'WITHDRAW', $2, $3, $4, $5, 'COMPLETED', CURRENT_TIMESTAMP)
-	`, userID, sum, "Withdrawal for order payment", orderNumber, referenceID)
+	`, userID, negativeSum, "Withdrawal for order payment", orderNumber, referenceID)
 
 	if err != nil {
 		return fmt.Errorf("failed to create transaction: %w", err)
@@ -670,4 +690,28 @@ func (s *PostgresStorage) GetTransactionByReference(ctx context.Context, referen
 	}
 
 	return &tx, nil
+}
+
+// GetAdvisoryLock получает advisory lock
+func (s *PostgresStorage) GetAdvisoryLock(ctx context.Context, key int64) (bool, error) {
+	var lockObtained bool
+	err := s.db.QueryRowContext(ctx, "SELECT pg_try_advisory_lock($1)", key).Scan(&lockObtained)
+	if err != nil {
+		return false, fmt.Errorf("failed to get advisory lock: %w", err)
+	}
+	return lockObtained, nil
+}
+
+// ReleaseAdvisoryLock освобождает advisory lock
+func (s *PostgresStorage) ReleaseAdvisoryLock(ctx context.Context, key int64) error {
+	_, err := s.db.ExecContext(ctx, "SELECT pg_advisory_unlock($1)", key)
+	if err != nil {
+		return fmt.Errorf("failed to release advisory lock: %w", err)
+	}
+	return nil
+}
+
+// GetDB возвращает соединение с БД (для recovery)
+func (s *PostgresStorage) GetDB() *sql.DB {
+	return s.db
 }

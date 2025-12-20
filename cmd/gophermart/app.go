@@ -67,10 +67,10 @@ func (a *App) getCurrentUserID(r *http.Request) (int, bool) {
 	return auth.GetUserIDFromContext(r.Context())
 }
 
-// getCurrentUserLogin получает логин текущего пользователя из контекста
-func (a *App) getCurrentUserLogin(r *http.Request) (string, bool) {
-	return auth.GetUserLoginFromContext(r.Context())
-}
+// // getCurrentUserLogin получает логин текущего пользователя из контекста
+// func (a *App) getCurrentUserLogin(r *http.Request) (string, bool) {
+// 	return auth.GetUserLoginFromContext(r.Context())
+// }
 
 // OrderHandler обработчик для загрузки номера заказа
 func (a *App) OrderHandler(w http.ResponseWriter, r *http.Request) {

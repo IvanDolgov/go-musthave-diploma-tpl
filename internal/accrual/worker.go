@@ -2,6 +2,7 @@ package accrual
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/logger"
@@ -25,11 +27,15 @@ type Worker struct {
 	pollInterval   time.Duration
 	concurrency    int
 	requestTimeout time.Duration
+	maxRetries     int
+	retryDelay     time.Duration
 	logger         *zap.Logger
 	stopChan       chan struct{}
 	wg             sync.WaitGroup
 	mu             sync.RWMutex
 	isRunning      bool
+	processedCount atomic.Int64
+	failedCount    atomic.Int64
 }
 
 // Config конфигурация для воркера
@@ -38,6 +44,8 @@ type Config struct {
 	PollInterval   time.Duration // Интервал опроса
 	Concurrency    int           // Количество параллельных горутин
 	RequestTimeout time.Duration // Таймаут запросов к accrual
+	MaxRetries     int           // Максимальное количество повторных попыток
+	RetryDelay     time.Duration // Задержка между повторными попытками
 }
 
 // NewWorker создает новый воркер
@@ -50,6 +58,12 @@ func NewWorker(storage storage.Storage, config Config) *Worker {
 	}
 	if config.RequestTimeout == 0 {
 		config.RequestTimeout = 10 * time.Second
+	}
+	if config.MaxRetries == 0 {
+		config.MaxRetries = 3
+	}
+	if config.RetryDelay == 0 {
+		config.RetryDelay = 1 * time.Second
 	}
 
 	return &Worker{
@@ -66,6 +80,8 @@ func NewWorker(storage storage.Storage, config Config) *Worker {
 		pollInterval:   config.PollInterval,
 		concurrency:    config.Concurrency,
 		requestTimeout: config.RequestTimeout,
+		maxRetries:     config.MaxRetries,
+		retryDelay:     config.RetryDelay,
 		logger:         logger.Log,
 		stopChan:       make(chan struct{}),
 	}
@@ -85,15 +101,19 @@ func (w *Worker) Start() {
 		zap.String("accrual_address", w.accrualAddress),
 		zap.Duration("poll_interval", w.pollInterval),
 		zap.Int("concurrency", w.concurrency),
+		zap.Int("max_retries", w.maxRetries),
 	)
 
-	w.wg.Add(w.concurrency)
+	// Сначала обрабатываем заказы, которые могли остаться в обработке после сбоя
+	w.recoverProcessingOrders()
+
+	// Запускаем воркеры
 	for i := 0; i < w.concurrency; i++ {
-		go w.processOrders(i)
+		w.wg.Add(1)
+		go w.worker(i)
 	}
 
-	w.wg.Add(1)
-	go w.pollOrders()
+	w.logger.Info("Accrual worker started successfully")
 }
 
 // Stop останавливает воркер
@@ -106,150 +126,249 @@ func (w *Worker) Stop() {
 	w.isRunning = false
 	w.mu.Unlock()
 
-	w.logger.Info("Stopping accrual worker")
+	w.logger.Info("Stopping accrual worker...")
 	close(w.stopChan)
 	w.wg.Wait()
-	w.logger.Info("Accrual worker stopped")
+
+	w.logger.Info("Accrual worker stopped",
+		zap.Int64("processed", w.processedCount.Load()),
+		zap.Int64("failed", w.failedCount.Load()))
 }
 
-// pollOrders периодически запускает обработку заказов
-func (w *Worker) pollOrders() {
-	defer w.wg.Done()
-
-	ticker := time.NewTicker(w.pollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-w.stopChan:
-			return
-		case <-ticker.C:
-			w.processBatch()
-		}
-	}
-}
-
-// processBatch обрабатывает партию заказов
-func (w *Worker) processBatch() {
+// recoverProcessingOrders восстанавливает заказы в статусе PROCESSING
+func (w *Worker) recoverProcessingOrders() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Получаем заказы для обработки
-	orders, err := w.storage.GetOrdersForProcessing(ctx, w.concurrency*10)
+	// Получаем заказы в статусе PROCESSING (возможно зависли после сбоя)
+	orders, err := w.getProcessingOrders(ctx)
 	if err != nil {
-		w.logger.Error("Failed to get orders for processing", zap.Error(err))
+		w.logger.Error("Failed to recover processing orders", zap.Error(err))
 		return
 	}
 
-	if len(orders) == 0 {
-		return
-	}
+	if len(orders) > 0 {
+		w.logger.Info("Recovering processing orders", zap.Int("count", len(orders)))
 
-	w.logger.Debug("Processing orders batch", zap.Int("count", len(orders)))
-
-	// Отправляем заказы в канал для обработки
-	ordersChan := make(chan models.Order, len(orders))
-	for _, order := range orders {
-		ordersChan <- order
-	}
-	close(ordersChan)
-
-	// Обрабатываем заказы параллельно
-	var wg sync.WaitGroup
-	for i := 0; i < w.concurrency; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			for order := range ordersChan {
-				w.processSingleOrder(ctx, order, workerID)
-			}
-		}(i)
-	}
-	wg.Wait()
-}
-
-// processOrders обработчик для отдельных горутин
-func (w *Worker) processOrders(workerID int) {
-	defer w.wg.Done()
-
-	for {
-		select {
-		case <-w.stopChan:
-			return
-		default:
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-
-			orders, err := w.storage.GetOrdersForProcessing(ctx, 1)
-			cancel()
-
+		for _, order := range orders {
+			// Сбрасываем статус на NEW для повторной обработки
+			err := w.storage.UpdateOrderAccrual(ctx, order.Number, "NEW", nil)
 			if err != nil {
-				w.logger.Error("Worker failed to get orders",
-					zap.Int("worker_id", workerID),
+				w.logger.Error("Failed to reset order status",
+					zap.String("order_number", order.Number),
 					zap.Error(err))
-				time.Sleep(w.pollInterval)
-				continue
+			} else {
+				w.logger.Debug("Order status reset to NEW",
+					zap.String("order_number", order.Number))
 			}
-
-			if len(orders) == 0 {
-				time.Sleep(w.pollInterval)
-				continue
-			}
-
-			ctx2, cancel2 := context.WithTimeout(context.Background(), w.requestTimeout)
-			w.processSingleOrder(ctx2, orders[0], workerID)
-			cancel2()
 		}
 	}
 }
 
+// getProcessingOrders возвращает заказы в статусе PROCESSING
+func (w *Worker) getProcessingOrders(ctx context.Context) ([]models.Order, error) {
+	// Используем GetOrdersForProcessing с фильтром по статусу
+	// Сначала получим все заказы для обработки
+	allOrders, err := w.storage.GetOrdersForProcessing(ctx, 100)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get orders for processing: %w", err)
+	}
+
+	// Отфильтруем только PROCESSING
+	var processingOrders []models.Order
+	for _, order := range allOrders {
+		if order.Status == "PROCESSING" {
+			processingOrders = append(processingOrders, order)
+		}
+	}
+
+	return processingOrders, nil
+}
+
+// getOrderForProcessing получает заказ для обработки с блокировкой
+func (w *Worker) getOrderForProcessing(workerID int) (*models.Order, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), w.requestTimeout)
+	defer cancel()
+
+	// Используем advisory lock для предотвращения одновременной обработки
+	// одним и тем же воркером разных инстансов
+	lockKey := int64(workerID + 1000) // Уникальный ключ для воркера
+
+	// Пытаемся получить блокировку
+	lockObtained, err := w.storage.(interface {
+		GetAdvisoryLock(ctx context.Context, key int64) (bool, error)
+	}).GetAdvisoryLock(ctx, lockKey)
+
+	if err != nil || !lockObtained {
+		return nil, fmt.Errorf("failed to obtain lock")
+	}
+	defer w.storage.(interface {
+		ReleaseAdvisoryLock(ctx context.Context, key int64) error
+	}).ReleaseAdvisoryLock(ctx, lockKey)
+
+	// Используем существующий метод GetOrdersForProcessing
+	orders, err := w.storage.GetOrdersForProcessing(ctx, 1)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(orders) == 0 {
+		return nil, sql.ErrNoRows
+	}
+
+	// Обновляем статус на PROCESSING
+	err = w.storage.UpdateOrderAccrual(ctx, orders[0].Number, "PROCESSING", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return &orders[0], nil
+}
+
 // processSingleOrder обрабатывает один заказ
-func (w *Worker) processSingleOrder(ctx context.Context, order models.Order, workerID int) {
+func (w *Worker) processSingleOrder(ctx context.Context, order *models.Order, workerID int, attempt int) error {
 	accrualResp, err := w.checkAccrualStatus(ctx, order.Number)
 	if err != nil {
-		w.logger.Error("Failed to check accrual status",
-			zap.Int("worker_id", workerID),
-			zap.String("order_number", order.Number),
-			zap.Error(err))
-		return
+		return fmt.Errorf("failed to check accrual status: %w", err)
 	}
 
 	// Обновляем статус заказа
 	err = w.storage.UpdateOrderAccrual(ctx, order.Number, accrualResp.Status, accrualResp.Accrual)
 	if err != nil {
-		w.logger.Error("Failed to update order accrual",
-			zap.Int("worker_id", workerID),
-			zap.String("order_number", order.Number),
-			zap.Error(err))
-		return
+		return fmt.Errorf("failed to update order accrual: %w", err)
 	}
 
 	// Если есть начисления, обновляем баланс
 	if accrualResp.Status == "PROCESSED" && accrualResp.Accrual != nil && *accrualResp.Accrual > 0 {
 		err = w.storage.AddAccrualToBalance(ctx, order.UserID, *accrualResp.Accrual)
 		if err != nil {
-			w.logger.Error("Failed to add accrual to balance",
-				zap.Int("worker_id", workerID),
-				zap.String("order_number", order.Number),
-				zap.Int("user_id", order.UserID),
-				zap.Float64("accrual", *accrualResp.Accrual),
-				zap.Error(err))
-
-			// Откатываем статус заказа для повторной обработки
+			// Если не удалось обновить баланс, откатываем статус
 			w.storage.UpdateOrderAccrual(ctx, order.Number, "PROCESSING", nil)
-			return
+			return fmt.Errorf("failed to add accrual to balance: %w", err)
 		}
 
 		w.logger.Info("Accrual added to balance",
 			zap.Int("worker_id", workerID),
 			zap.String("order_number", order.Number),
 			zap.Int("user_id", order.UserID),
-			zap.Float64("accrual", *accrualResp.Accrual))
+			zap.Float64("accrual", *accrualResp.Accrual),
+			zap.Int("attempt", attempt))
 	}
 
-	w.logger.Debug("Order processed",
+	return nil
+}
+
+// worker основной воркер
+func (w *Worker) worker(id int) {
+	defer w.wg.Done()
+
+	w.logger.Debug("Worker started", zap.Int("worker_id", id))
+
+	for {
+		select {
+		case <-w.stopChan:
+			w.logger.Debug("Worker stopping", zap.Int("worker_id", id))
+			return
+		default:
+			// Получаем заказ для обработки с блокировкой
+			order, err := w.getOrderForProcessing(id)
+			if err != nil {
+				if err != sql.ErrNoRows {
+					w.logger.Error("Worker failed to get order",
+						zap.Int("worker_id", id),
+						zap.Error(err))
+				}
+				// Если нет заказов, ждем перед следующей попыткой
+				time.Sleep(w.pollInterval)
+				continue
+			}
+
+			if order == nil {
+				// Нет заказов для обработки
+				time.Sleep(w.pollInterval)
+				continue
+			}
+
+			// Обрабатываем заказ с повторными попытками
+			w.processOrderWithRetry(id, order)
+		}
+	}
+}
+
+// processOrderWithRetry обрабатывает заказ с повторными попытками
+func (w *Worker) processOrderWithRetry(workerID int, order *models.Order) {
+	var lastErr error
+
+	for attempt := 1; attempt <= w.maxRetries; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), w.requestTimeout)
+
+		err := w.processSingleOrder(ctx, order, workerID, attempt)
+		cancel()
+
+		if err == nil {
+			// Успешно обработано
+			w.processedCount.Add(1)
+			w.logger.Debug("Order processed successfully",
+				zap.Int("worker_id", workerID),
+				zap.String("order_number", order.Number),
+				zap.Int("attempt", attempt))
+			return
+		}
+
+		lastErr = err
+
+		// Если это временная ошибка (например, сеть), пробуем еще раз
+		if w.isTemporaryError(err) && attempt < w.maxRetries {
+			w.logger.Warn("Temporary error, retrying",
+				zap.Int("worker_id", workerID),
+				zap.String("order_number", order.Number),
+				zap.Int("attempt", attempt),
+				zap.Int("max_attempts", w.maxRetries),
+				zap.Error(err))
+
+			// Экспоненциальный бекофф
+			delay := w.retryDelay * time.Duration(1<<(attempt-1))
+			time.Sleep(delay)
+			continue
+		}
+
+		// Если это не временная ошибка, выходим
+		break
+	}
+
+	// Все попытки провалились
+	w.failedCount.Add(1)
+	w.logger.Error("Failed to process order after all attempts",
 		zap.Int("worker_id", workerID),
 		zap.String("order_number", order.Number),
-		zap.String("status", accrualResp.Status))
+		zap.Int("max_attempts", w.maxRetries),
+		zap.Error(lastErr))
+
+	// Обновляем статус заказа на INVALID для дальнейшего анализа
+	ctx, cancel := context.WithTimeout(context.Background(), w.requestTimeout)
+	defer cancel()
+
+	err := w.storage.UpdateOrderAccrual(ctx, order.Number, "INVALID", nil)
+	if err != nil {
+		w.logger.Error("Failed to mark order as invalid",
+			zap.String("order_number", order.Number),
+			zap.Error(err))
+	}
+}
+
+// isTemporaryError проверяет, является ли ошибка временной
+func (w *Worker) isTemporaryError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+	// Временные ошибки: сетевые, таймауты, 429 (Too Many Requests)
+	return strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "network") ||
+		strings.Contains(errStr, "connection") ||
+		strings.Contains(errStr, "429") ||
+		strings.Contains(errStr, "rate limit")
 }
 
 // checkAccrualStatus проверяет статус заказа в системе accrual
@@ -262,6 +381,7 @@ func (w *Worker) checkAccrualStatus(ctx context.Context, orderNumber string) (*m
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Gophermart-Accrual-Worker/1.0")
 
 	resp, err := w.client.Do(req)
 	if err != nil {
@@ -285,29 +405,37 @@ func (w *Worker) checkAccrualStatus(ctx context.Context, orderNumber string) (*m
 
 	case http.StatusNoContent:
 		// Заказ не найден в системе accrual
+		zeroAccrual := float64(0)
 		return &models.AccrualResponse{
-			Order:  orderNumber,
-			Status: "INVALID",
+			Order:   orderNumber,
+			Status:  "INVALID",
+			Accrual: &zeroAccrual, // Указатель на 0
+		}, nil
+
+	case http.StatusNotFound:
+		// Система accrual не знает о заказе
+		zeroAccrual := float64(0)
+		return &models.AccrualResponse{
+			Order:   orderNumber,
+			Status:  "INVALID",
+			Accrual: &zeroAccrual, // Указатель на 0
 		}, nil
 
 	case http.StatusTooManyRequests:
-		// Превышен лимит запросов
 		retryAfter := resp.Header.Get("Retry-After")
 		if retryAfter != "" {
 			if seconds, err := strconv.Atoi(retryAfter); err == nil {
 				time.Sleep(time.Duration(seconds) * time.Second)
 			}
 		}
-		return nil, fmt.Errorf("rate limit exceeded")
-
-	case http.StatusNotFound:
-		// Система accrual не знает о заказе
-		return &models.AccrualResponse{
-			Order:  orderNumber,
-			Status: "INVALID",
-		}, nil
+		return nil, fmt.Errorf("rate limit exceeded (429)")
 
 	default:
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
+}
+
+// GetStats возвращает статистику работы воркера
+func (w *Worker) GetStats() (processed, failed int64) {
+	return w.processedCount.Load(), w.failedCount.Load()
 }
