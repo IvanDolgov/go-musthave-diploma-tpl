@@ -267,7 +267,7 @@ func (s *PostgresStorage) GetOrdersByUserID(ctx context.Context, userID int) ([]
 		SELECT number, status, accrual, uploaded_at, processed_at
 		FROM orders
 		WHERE user_id = $1
-		ORDER BY uploaded_at ASC
+		ORDER BY uploaded_at DESC
 	`
 
 	rows, err := s.db.QueryContext(ctx, query, userID)

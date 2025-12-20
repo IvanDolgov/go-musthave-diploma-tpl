@@ -137,12 +137,22 @@ func (w *Worker) processSingleOrder(ctx context.Context, order models.Order) {
 		w.logger.Error("Failed to check accrual status",
 			zap.String("order_number", order.Number),
 			zap.Error(err))
+
+		// Если ошибка при запросе, обновляем статус на INVALID
+		if strings.Contains(err.Error(), "rate limit") {
+			// Для rate limit не меняем статус, попробуем позже
+			return
+		}
+
+		// Для других ошибок - ставим INVALID
+		w.updateOrderAsInvalid(ctx, order.Number)
 		return
 	}
 
 	// Проверяем, изменился ли статус
 	if order.Status == accrualResp.Status &&
-		(order.Accrual != nil && accrualResp.Accrual != nil && *order.Accrual == *accrualResp.Accrual) {
+		((order.Accrual == nil && accrualResp.Accrual == nil) ||
+			(order.Accrual != nil && accrualResp.Accrual != nil && *order.Accrual == *accrualResp.Accrual)) {
 		w.logger.Debug("Order status unchanged, skipping",
 			zap.String("order_number", order.Number))
 		return
@@ -178,6 +188,19 @@ func (w *Worker) processSingleOrder(ctx context.Context, order models.Order) {
 	}
 }
 
+// updateOrderAsInvalid обновляет статус заказа на INVALID
+func (w *Worker) updateOrderAsInvalid(ctx context.Context, orderNumber string) {
+	err := w.storage.UpdateOrderAccrual(ctx, orderNumber, "INVALID", nil)
+	if err != nil {
+		w.logger.Error("Failed to update order as INVALID",
+			zap.String("order_number", orderNumber),
+			zap.Error(err))
+		return
+	}
+	w.logger.Info("Order marked as INVALID",
+		zap.String("order_number", orderNumber))
+}
+
 // checkAccrualStatus проверяет статус заказа в системе accrual
 func (w *Worker) checkAccrualStatus(ctx context.Context, orderNumber string) (*models.AccrualResponse, error) {
 	url := fmt.Sprintf("%s/api/orders/%s", w.accrualAddress, orderNumber)
@@ -207,15 +230,19 @@ func (w *Worker) checkAccrualStatus(ctx context.Context, orderNumber string) (*m
 			return nil, fmt.Errorf("failed to decode response: %w", err)
 		}
 
+		// Валидируем полученные данные
+		if accrualResp.Order == "" {
+			accrualResp.Order = orderNumber
+		}
+
 		return &accrualResp, nil
 
 	case http.StatusNoContent:
-		// Заказ не найден в системе accrual
-		zeroAccrual := float64(0)
+		// Заказ не найден в системе accrual - статус INVALID
 		return &models.AccrualResponse{
 			Order:   orderNumber,
 			Status:  "INVALID",
-			Accrual: &zeroAccrual,
+			Accrual: nil,
 		}, nil
 
 	case http.StatusTooManyRequests:
@@ -229,16 +256,20 @@ func (w *Worker) checkAccrualStatus(ctx context.Context, orderNumber string) (*m
 		return nil, fmt.Errorf("rate limit exceeded")
 
 	case http.StatusNotFound:
-		// Система accrual не знает о заказе
-		zeroAccrual := float64(0)
+		// Система accrual не знает о заказе - статус INVALID
 		return &models.AccrualResponse{
 			Order:   orderNumber,
 			Status:  "INVALID",
-			Accrual: &zeroAccrual,
+			Accrual: nil,
 		}, nil
 
 	default:
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		// Любой другой статус - тоже считаем INVALID
+		return &models.AccrualResponse{
+			Order:   orderNumber,
+			Status:  "INVALID",
+			Accrual: nil,
+		}, nil
 	}
 }
 
