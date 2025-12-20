@@ -63,13 +63,12 @@ func run(cfg models.Config) error {
 	// Создаем App для обработки всех хендлеров
 	app := NewApp(store, jwtManager, &cfg)
 
-	// Создаем и запускаем accrual worker
+	// В функции run:
 	if cfg.AccrualSystemAddress != "" {
 		workerConfig := accrual.Config{
 			AccrualAddress: cfg.AccrualSystemAddress,
-			PollInterval:   5 * time.Second,
-			Concurrency:    10,
-			RequestTimeout: 10 * time.Second,
+			PollInterval:   1 * time.Second, // Уменьшаем интервал для тестов
+			RequestTimeout: 5 * time.Second,
 		}
 
 		worker := accrual.NewWorker(store, workerConfig)
@@ -77,7 +76,8 @@ func run(cfg models.Config) error {
 		defer worker.Stop()
 
 		logger.Log.Info("Accrual worker started",
-			zap.String("address", cfg.AccrualSystemAddress))
+			zap.String("address", cfg.AccrualSystemAddress),
+			zap.Duration("poll_interval", workerConfig.PollInterval))
 	} else {
 		logger.Log.Warn("Accrual system address not configured, worker not started")
 	}

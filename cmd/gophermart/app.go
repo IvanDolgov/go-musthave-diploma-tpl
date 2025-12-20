@@ -301,11 +301,14 @@ func (a *App) GetWithdrawalsHandler(w http.ResponseWriter, r *http.Request) {
 
 // processOrderAsync асинхронно обрабатывает заказ в системе accrual
 func (a *App) processOrderAsync(orderNumber string) {
+	a.logger.Info("Starting async order processing",
+		zap.String("order_number", orderNumber))
+
 	ctx := context.Background()
 
-	// Используем экспоненциальный бекофф для повторных попыток
-	maxAttempts := 100
-	delay := time.Second
+	// Уменьшаем интервалы для тестов
+	maxAttempts := 30 // 30 секунд максимум
+	delay := 100 * time.Millisecond
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		// Проверяем статус заказа в системе accrual
@@ -313,7 +316,8 @@ func (a *App) processOrderAsync(orderNumber string) {
 		if err == nil {
 			// Успешно обработано
 			a.logger.Info("Order processed successfully",
-				zap.String("order_number", orderNumber))
+				zap.String("order_number", orderNumber),
+				zap.Int("attempt", attempt))
 			return
 		}
 
@@ -326,8 +330,8 @@ func (a *App) processOrderAsync(orderNumber string) {
 			// Увеличиваем задержку экспоненциально
 			time.Sleep(delay)
 			delay = time.Duration(float64(delay) * 1.5)
-			if delay > 60*time.Second {
-				delay = 60 * time.Second
+			if delay > 2*time.Second {
+				delay = 2 * time.Second
 			}
 			continue
 		}
