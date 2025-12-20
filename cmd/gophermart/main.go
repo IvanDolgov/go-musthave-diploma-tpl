@@ -59,6 +59,9 @@ func run(cfg models.Config) error {
 	// Создаем хендлеры аутентификации
 	authHandlers := NewAuthHandlers(store, jwtManager)
 
+	// Создаем App для обработки всех хендлеров
+	app := NewApp(store, jwtManager, &cfg)
+
 	// создаем строку с сервером
 	fullPathServer := buildServerAddress(cfg.Server, cfg.Port)
 
@@ -84,6 +87,22 @@ func run(cfg models.Config) error {
 
 	router.Post(`/api/user/login`, authHandlers.authUsers())
 	router.Post(`/api/user/login/`, authHandlers.authUsers())
+
+	// Новые маршруты для работы с заказами и балансом
+	router.Post(`/api/user/orders`, app.OrderHandler)
+	router.Post(`/api/user/orders/`, app.OrderHandler)
+
+	router.Get(`/api/user/orders`, app.GetOrdersHandler)
+	router.Get(`/api/user/orders/`, app.GetOrdersHandler)
+
+	router.Get(`/api/user/balance`, app.GetBalanceHandler)
+	router.Get(`/api/user/balance/`, app.GetBalanceHandler)
+
+	router.Post(`/api/user/balance/withdraw`, app.WithdrawHandler)
+	router.Post(`/api/user/balance/withdraw/`, app.WithdrawHandler)
+
+	router.Get(`/api/user/withdrawals`, app.GetWithdrawalsHandler)
+	router.Get(`/api/user/withdrawals/`, app.GetWithdrawalsHandler)
 
 	// HTTP сервер
 	server := &http.Server{

@@ -3,8 +3,8 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/error/pgerrors"
@@ -56,22 +56,15 @@ func NewPostgresStorage(ctx context.Context, connectionString string) (storage.S
 	}, nil
 }
 
-// // SaveToFile - для совместимости с интерфейсом
-// func (s *PostgresStorage) SaveToFile(ctx context.Context, filename string) error {
-//     return nil
-// }
-
-// // LoadFromFile - для совместимости с интерфейсом
-// func (s *PostgresStorage) LoadFromFile(ctx context.Context, filename string) error {
-//     return nil
-// }
-
-// Close закрывает соединение с БД
+// Close закрывает подключение к базе данных
 func (s *PostgresStorage) Close() error {
-	return s.db.Close()
+	if s.db != nil {
+		return s.db.Close()
+	}
+	return nil
 }
 
-// Ping проверяет соединение с БД
+// Ping проверяет подключение к базе данных
 func (s *PostgresStorage) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
 }
@@ -79,20 +72,23 @@ func (s *PostgresStorage) Ping(ctx context.Context) error {
 // CreateUser создает нового пользователя
 func (s *PostgresStorage) CreateUser(ctx context.Context, login, hashedPassword string) error {
 	query := `
-        INSERT INTO users (login, password, created_at, updated_at) 
-        VALUES ($1, $2, $3, $4)
-    `
+		INSERT INTO users (login, password)
+		VALUES ($1, $2)
+		ON CONFLICT (login) DO NOTHING
+	`
 
-	now := time.Now()
-	_, err := s.db.ExecContext(ctx, query, login, hashedPassword, now, now)
-
+	result, err := s.db.ExecContext(ctx, query, login, hashedPassword)
 	if err != nil {
-		// Проверяем, является ли ошибка нарушением уникальности
-		if strings.Contains(err.Error(), "duplicate key value") ||
-			strings.Contains(err.Error(), "unique constraint") {
-			return fmt.Errorf("user with login '%s' already exists", login)
-		}
 		return fmt.Errorf("failed to create user: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("user with login '%s' already exists", login)
 	}
 
 	return nil
@@ -100,14 +96,13 @@ func (s *PostgresStorage) CreateUser(ctx context.Context, login, hashedPassword 
 
 // GetUserByLogin возвращает пользователя по логину
 func (s *PostgresStorage) GetUserByLogin(ctx context.Context, login string) (models.User, error) {
-	var user models.User
-
 	query := `
-        SELECT id, login, password, created_at, updated_at 
-        FROM users 
-        WHERE login = $1
-    `
+		SELECT id, login, password, created_at, updated_at
+		FROM users
+		WHERE login = $1
+	`
 
+	var user models.User
 	err := s.db.QueryRowContext(ctx, query, login).Scan(
 		&user.ID,
 		&user.Login,
@@ -118,9 +113,9 @@ func (s *PostgresStorage) GetUserByLogin(ctx context.Context, login string) (mod
 
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return user, sql.ErrNoRows
+			return models.User{}, fmt.Errorf("user not found: %w", err)
 		}
-		return user, fmt.Errorf("failed to get user: %w", err)
+		return models.User{}, fmt.Errorf("failed to get user by login: %w", err)
 	}
 
 	return user, nil
@@ -128,14 +123,13 @@ func (s *PostgresStorage) GetUserByLogin(ctx context.Context, login string) (mod
 
 // GetUserByID возвращает пользователя по ID
 func (s *PostgresStorage) GetUserByID(ctx context.Context, id int) (models.User, error) {
-	var user models.User
-
 	query := `
-        SELECT id, login, password, created_at, updated_at 
-        FROM users 
-        WHERE id = $1
-    `
+		SELECT id, login, password, created_at, updated_at
+		FROM users
+		WHERE id = $1
+	`
 
+	var user models.User
 	err := s.db.QueryRowContext(ctx, query, id).Scan(
 		&user.ID,
 		&user.Login,
@@ -145,26 +139,313 @@ func (s *PostgresStorage) GetUserByID(ctx context.Context, id int) (models.User,
 	)
 
 	if err != nil {
-		return user, fmt.Errorf("failed to get user by ID: %w", err)
+		if err == sql.ErrNoRows {
+			return models.User{}, fmt.Errorf("user not found: %w", err)
+		}
+		return models.User{}, fmt.Errorf("failed to get user by id: %w", err)
 	}
 
 	return user, nil
 }
 
-// UserExists проверяет существование пользователя по логину
+// UserExists проверяет существование пользователя
 func (s *PostgresStorage) UserExists(ctx context.Context, login string) (bool, error) {
-	var exists bool
-
 	query := `
-        SELECT EXISTS(
-            SELECT 1 FROM users WHERE login = $1
-        )
-    `
+		SELECT EXISTS(SELECT 1 FROM users WHERE login = $1)
+	`
 
+	var exists bool
 	err := s.db.QueryRowContext(ctx, query, login).Scan(&exists)
 	if err != nil {
-		return false, fmt.Errorf("failed to check user existence: %w", err)
+		return false, fmt.Errorf("failed to check if user exists: %w", err)
 	}
 
 	return exists, nil
+}
+
+// CreateOrder создает новый заказ
+func (s *PostgresStorage) CreateOrder(ctx context.Context, userID int, orderNumber string) error {
+	query := `
+		INSERT INTO orders (user_id, number, status)
+		VALUES ($1, $2, 'NEW')
+		ON CONFLICT (number) DO NOTHING
+	`
+
+	result, err := s.db.ExecContext(ctx, query, userID, orderNumber)
+	if err != nil {
+		return fmt.Errorf("failed to create order: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("order with number '%s' already exists", orderNumber)
+	}
+
+	return nil
+}
+
+// GetOrderByNumber возвращает заказ по номеру
+func (s *PostgresStorage) GetOrderByNumber(ctx context.Context, number string) (*models.Order, error) {
+	query := `
+		SELECT id, user_id, number, status, accrual, uploaded_at, processed_at
+		FROM orders
+		WHERE number = $1
+	`
+
+	var order models.Order
+	var accrual sql.NullFloat64
+	var processedAt sql.NullTime
+
+	err := s.db.QueryRowContext(ctx, query, number).Scan(
+		&order.ID,
+		&order.UserID,
+		&order.Number,
+		&order.Status,
+		&accrual,
+		&order.UploadedAt,
+		&processedAt,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get order by number: %w", err)
+	}
+
+	if accrual.Valid {
+		accrualValue := accrual.Float64
+		order.Accrual = &accrualValue
+	}
+
+	if processedAt.Valid {
+		pt := processedAt.Time
+		order.ProcessedAt = &pt
+	}
+
+	return &order, nil
+}
+
+// GetOrdersByUserID возвращает все заказы пользователя
+func (s *PostgresStorage) GetOrdersByUserID(ctx context.Context, userID int) ([]models.Order, error) {
+	query := `
+		SELECT number, status, accrual, uploaded_at, processed_at
+		FROM orders
+		WHERE user_id = $1
+		ORDER BY uploaded_at ASC
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get orders by user id: %w", err)
+	}
+	defer rows.Close()
+
+	var orders []models.Order
+	for rows.Next() {
+		var order models.Order
+		var accrual sql.NullFloat64
+		var processedAt sql.NullTime
+
+		err := rows.Scan(
+			&order.Number,
+			&order.Status,
+			&accrual,
+			&order.UploadedAt,
+			&processedAt,
+		)
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan order: %w", err)
+		}
+
+		if accrual.Valid {
+			accrualValue := accrual.Float64
+			order.Accrual = &accrualValue
+		}
+
+		if processedAt.Valid {
+			pt := processedAt.Time
+			order.ProcessedAt = &pt
+		}
+
+		orders = append(orders, order)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error: %w", err)
+	}
+
+	return orders, nil
+}
+
+// UpdateOrderAccrual обновляет статус и начисления заказа
+func (s *PostgresStorage) UpdateOrderAccrual(ctx context.Context, number string, status string, accrual *float64) error {
+	query := `
+		UPDATE orders
+		SET status = $1, accrual = $2, processed_at = $3, updated_at = CURRENT_TIMESTAMP
+		WHERE number = $4
+	`
+
+	var accrualValue interface{}
+	var processedAt interface{}
+
+	if accrual != nil {
+		accrualValue = *accrual
+		processedAt = time.Now()
+	} else {
+		accrualValue = nil
+		processedAt = nil
+	}
+
+	_, err := s.db.ExecContext(ctx, query, status, accrualValue, processedAt, number)
+	if err != nil {
+		return fmt.Errorf("failed to update order accrual: %w", err)
+	}
+
+	return nil
+}
+
+// GetBalance возвращает баланс пользователя
+func (s *PostgresStorage) GetBalance(ctx context.Context, userID int) (*models.Balance, error) {
+	// Сначала создаем запись баланса, если ее нет
+	upsertQuery := `
+		INSERT INTO balances (user_id, current, withdrawn)
+		VALUES ($1, 0, 0)
+		ON CONFLICT (user_id) DO NOTHING
+	`
+	_, _ = s.db.ExecContext(ctx, upsertQuery, userID)
+
+	query := `
+		SELECT current, withdrawn
+		FROM balances
+		WHERE user_id = $1
+	`
+
+	var balance models.Balance
+	balance.UserID = userID
+
+	err := s.db.QueryRowContext(ctx, query, userID).Scan(
+		&balance.Current,
+		&balance.Withdrawn,
+	)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return &balance, nil
+		}
+		return nil, fmt.Errorf("failed to get balance: %w", err)
+	}
+
+	return &balance, nil
+}
+
+// AddAccrualToBalance добавляет начисления к балансу
+func (s *PostgresStorage) AddAccrualToBalance(ctx context.Context, userID int, accrual float64) error {
+	query := `
+		UPDATE balances
+		SET current = current + $1, updated_at = CURRENT_TIMESTAMP
+		WHERE user_id = $2
+	`
+
+	_, err := s.db.ExecContext(ctx, query, accrual, userID)
+	if err != nil {
+		return fmt.Errorf("failed to add accrual to balance: %w", err)
+	}
+
+	return nil
+}
+
+// CreateWithdrawal создает запись о списании
+func (s *PostgresStorage) CreateWithdrawal(ctx context.Context, userID int, orderNumber string, sum float64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Проверяем, достаточно ли средств
+	var currentBalance float64
+	err = tx.QueryRowContext(ctx, "SELECT current FROM balances WHERE user_id = $1 FOR UPDATE", userID).Scan(&currentBalance)
+	if err != nil {
+		return fmt.Errorf("failed to get balance for update: %w", err)
+	}
+
+	if currentBalance < sum {
+		return fmt.Errorf("insufficient funds")
+	}
+
+	// Проверяем, не использовался ли уже этот номер заказа для списания
+	var existingWithdrawal int
+	err = tx.QueryRowContext(ctx, "SELECT 1 FROM withdrawals WHERE order_number = $1", orderNumber).Scan(&existingWithdrawal)
+	if err == nil {
+		return fmt.Errorf("order number already used for withdrawal")
+	}
+
+	// Создаем запись о списании
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO withdrawals (user_id, order_number, sum)
+		VALUES ($1, $2, $3)
+	`, userID, orderNumber, sum)
+
+	if err != nil {
+		return fmt.Errorf("failed to create withdrawal: %w", err)
+	}
+
+	// Обновляем баланс
+	_, err = tx.ExecContext(ctx, `
+		UPDATE balances
+		SET current = current - $1, withdrawn = withdrawn + $1, updated_at = CURRENT_TIMESTAMP
+		WHERE user_id = $2
+	`, sum, userID)
+
+	if err != nil {
+		return fmt.Errorf("failed to update balance: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// GetWithdrawalsByUserID возвращает списания пользователя
+func (s *PostgresStorage) GetWithdrawalsByUserID(ctx context.Context, userID int) ([]models.Withdrawal, error) {
+	query := `
+		SELECT order_number, sum, processed_at
+		FROM withdrawals
+		WHERE user_id = $1
+		ORDER BY processed_at ASC
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get withdrawals: %w", err)
+	}
+	defer rows.Close()
+
+	var withdrawals []models.Withdrawal
+	for rows.Next() {
+		var withdrawal models.Withdrawal
+		withdrawal.UserID = userID
+
+		err := rows.Scan(
+			&withdrawal.OrderNumber,
+			&withdrawal.Sum,
+			&withdrawal.ProcessedAt,
+		)
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan withdrawal: %w", err)
+		}
+
+		withdrawals = append(withdrawals, withdrawal)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error: %w", err)
+	}
+
+	return withdrawals, nil
 }

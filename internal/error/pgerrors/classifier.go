@@ -108,3 +108,9 @@ func (c *PostgresErrorClassifier) IsTransactionError(err error) bool {
 	}
 	return false
 }
+
+// NewClassifier создает новый классификатор ошибок
+// Это алиас для NewPostgresErrorClassifier для обратной совместимости
+func NewClassifier() *PostgresErrorClassifier {
+	return NewPostgresErrorClassifier()
+}
