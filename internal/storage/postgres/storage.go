@@ -344,23 +344,41 @@ func (s *PostgresStorage) GetBalance(ctx context.Context, userID int) (*models.B
 	return &balance, nil
 }
 
-// AddAccrualToBalance добавляет начисления к балансу
+// AddAccrualToBalance добавляет начисления к балансу и создает транзакцию
 func (s *PostgresStorage) AddAccrualToBalance(ctx context.Context, userID int, accrual float64) error {
-	query := `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Обновляем баланс
+	_, err = tx.ExecContext(ctx, `
 		UPDATE balances
 		SET current = current + $1, updated_at = CURRENT_TIMESTAMP
 		WHERE user_id = $2
-	`
+	`, accrual, userID)
 
-	_, err := s.db.ExecContext(ctx, query, accrual, userID)
 	if err != nil {
-		return fmt.Errorf("failed to add accrual to balance: %w", err)
+		return fmt.Errorf("failed to update balance: %w", err)
 	}
 
-	return nil
+	// Создаем транзакцию
+	referenceID := fmt.Sprintf("accrual_%d_%d", userID, time.Now().UnixNano())
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO transactions (
+			user_id, type, amount, description, reference_id, status, processed_at
+		) VALUES ($1, 'ACCRUAL', $2, $3, $4, 'COMPLETED', CURRENT_TIMESTAMP)
+	`, userID, accrual, "Accrual from order processing", referenceID)
+
+	if err != nil {
+		return fmt.Errorf("failed to create transaction: %w", err)
+	}
+
+	return tx.Commit()
 }
 
-// CreateWithdrawal создает запись о списании
+// CreateWithdrawal создает запись о списании и транзакцию
 func (s *PostgresStorage) CreateWithdrawal(ctx context.Context, userID int, orderNumber string, sum float64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -407,6 +425,18 @@ func (s *PostgresStorage) CreateWithdrawal(ctx context.Context, userID int, orde
 		return fmt.Errorf("failed to update balance: %w", err)
 	}
 
+	// Создаем транзакцию
+	referenceID := fmt.Sprintf("withdraw_%s_%d", orderNumber, time.Now().UnixNano())
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO transactions (
+			user_id, type, amount, description, order_number, reference_id, status, processed_at
+		) VALUES ($1, 'WITHDRAW', $2, $3, $4, $5, 'COMPLETED', CURRENT_TIMESTAMP)
+	`, userID, sum, "Withdrawal for order payment", orderNumber, referenceID)
+
+	if err != nil {
+		return fmt.Errorf("failed to create transaction: %w", err)
+	}
+
 	return tx.Commit()
 }
 
@@ -448,4 +478,196 @@ func (s *PostgresStorage) GetWithdrawalsByUserID(ctx context.Context, userID int
 	}
 
 	return withdrawals, nil
+}
+
+// GetOrdersForProcessing возвращает заказы для обработки в accrual системе
+func (s *PostgresStorage) GetOrdersForProcessing(ctx context.Context, limit int) ([]models.Order, error) {
+	query := `
+		SELECT id, user_id, number, status, accrual, uploaded_at, processed_at
+		FROM orders
+		WHERE status IN ('NEW', 'PROCESSING')
+		ORDER BY uploaded_at ASC
+		LIMIT $1
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get orders for processing: %w", err)
+	}
+	defer rows.Close()
+
+	var orders []models.Order
+	for rows.Next() {
+		var order models.Order
+		var accrual sql.NullFloat64
+		var processedAt sql.NullTime
+
+		err := rows.Scan(
+			&order.ID,
+			&order.UserID,
+			&order.Number,
+			&order.Status,
+			&accrual,
+			&order.UploadedAt,
+			&processedAt,
+		)
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan order: %w", err)
+		}
+
+		if accrual.Valid {
+			accrualValue := accrual.Float64
+			order.Accrual = &accrualValue
+		}
+
+		if processedAt.Valid {
+			pt := processedAt.Time
+			order.ProcessedAt = &pt
+		}
+
+		orders = append(orders, order)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error: %w", err)
+	}
+
+	return orders, nil
+}
+
+// CreateTransaction создает новую транзакцию
+func (s *PostgresStorage) CreateTransaction(ctx context.Context, tx *models.Transaction) error {
+	query := `
+		INSERT INTO transactions (
+			user_id, type, amount, description, order_number, reference_id, status
+		) VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, created_at
+	`
+
+	err := s.db.QueryRowContext(ctx, query,
+		tx.UserID,
+		tx.Type,
+		tx.Amount,
+		tx.Description,
+		tx.OrderNumber,
+		tx.ReferenceID,
+		tx.Status,
+	).Scan(&tx.ID, &tx.CreatedAt)
+
+	if err != nil {
+		return fmt.Errorf("failed to create transaction: %w", err)
+	}
+
+	return nil
+}
+
+// GetUserTransactions возвращает транзакции пользователя
+func (s *PostgresStorage) GetUserTransactions(ctx context.Context, userID int, limit, offset int) ([]models.Transaction, error) {
+	query := `
+		SELECT id, user_id, type, amount, description, order_number, reference_id, status, created_at, processed_at
+		FROM transactions
+		WHERE user_id = $1
+		ORDER BY created_at DESC
+		LIMIT $2 OFFSET $3
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, userID, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user transactions: %w", err)
+	}
+	defer rows.Close()
+
+	var transactions []models.Transaction
+	for rows.Next() {
+		var tx models.Transaction
+		var orderNumber, referenceID sql.NullString
+		var processedAt sql.NullTime
+
+		err := rows.Scan(
+			&tx.ID,
+			&tx.UserID,
+			&tx.Type,
+			&tx.Amount,
+			&tx.Description,
+			&orderNumber,
+			&referenceID,
+			&tx.Status,
+			&tx.CreatedAt,
+			&processedAt,
+		)
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan transaction: %w", err)
+		}
+
+		if orderNumber.Valid {
+			tx.OrderNumber = &orderNumber.String
+		}
+
+		if referenceID.Valid {
+			tx.ReferenceID = &referenceID.String
+		}
+
+		if processedAt.Valid {
+			pt := processedAt.Time
+			tx.ProcessedAt = &pt
+		}
+
+		transactions = append(transactions, tx)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error: %w", err)
+	}
+
+	return transactions, nil
+}
+
+// GetTransactionByReference возвращает транзакцию по reference ID
+func (s *PostgresStorage) GetTransactionByReference(ctx context.Context, referenceID string) (*models.Transaction, error) {
+	query := `
+		SELECT id, user_id, type, amount, description, order_number, reference_id, status, created_at, processed_at
+		FROM transactions
+		WHERE reference_id = $1
+	`
+
+	var tx models.Transaction
+	var orderNumber, refID sql.NullString
+	var processedAt sql.NullTime
+
+	err := s.db.QueryRowContext(ctx, query, referenceID).Scan(
+		&tx.ID,
+		&tx.UserID,
+		&tx.Type,
+		&tx.Amount,
+		&tx.Description,
+		&orderNumber,
+		&refID,
+		&tx.Status,
+		&tx.CreatedAt,
+		&processedAt,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get transaction by reference: %w", err)
+	}
+
+	if orderNumber.Valid {
+		tx.OrderNumber = &orderNumber.String
+	}
+
+	if refID.Valid {
+		tx.ReferenceID = &refID.String
+	}
+
+	if processedAt.Valid {
+		pt := processedAt.Time
+		tx.ProcessedAt = &pt
+	}
+
+	return &tx, nil
 }

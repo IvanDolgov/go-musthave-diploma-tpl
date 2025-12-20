@@ -20,6 +20,7 @@ type OrderStorage interface {
 	GetOrderByNumber(ctx context.Context, number string) (*models.Order, error)
 	GetOrdersByUserID(ctx context.Context, userID int) ([]models.Order, error)
 	UpdateOrderAccrual(ctx context.Context, number string, status string, accrual *float64) error
+	GetOrdersForProcessing(ctx context.Context, limit int) ([]models.Order, error) // НОВОЕ
 }
 
 // BalanceStorage интерфейс для работы с балансом
@@ -36,11 +37,18 @@ type DatabaseStorage interface {
 	Close() error
 }
 
+// TransactionStorage интерфейс для работы с транзакциями
+type TransactionStorage interface {
+	CreateTransaction(ctx context.Context, tx *models.Transaction) error
+	GetUserTransactions(ctx context.Context, userID int, limit, offset int) ([]models.Transaction, error)
+	GetTransactionByReference(ctx context.Context, referenceID string) (*models.Transaction, error)
+}
+
 // Storage интерфейс объединяющий все возможности хранилища
 type Storage interface {
 	DatabaseStorage
 	UserStorage
 	OrderStorage
 	BalanceStorage
-	// Здесь можно добавить другие интерфейсы по мере необходимости
+	TransactionStorage
 }

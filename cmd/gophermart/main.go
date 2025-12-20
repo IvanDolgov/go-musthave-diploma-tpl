@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/accrual"
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/auth"
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/config"
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/logger"
@@ -61,6 +62,25 @@ func run(cfg models.Config) error {
 
 	// Создаем App для обработки всех хендлеров
 	app := NewApp(store, jwtManager, &cfg)
+
+	// Создаем и запускаем accrual worker
+	if cfg.AccrualSystemAddress != "" {
+		workerConfig := accrual.Config{
+			AccrualAddress: cfg.AccrualSystemAddress,
+			PollInterval:   5 * time.Second,
+			Concurrency:    10,
+			RequestTimeout: 10 * time.Second,
+		}
+
+		worker := accrual.NewWorker(store, workerConfig)
+		worker.Start()
+		defer worker.Stop()
+
+		logger.Log.Info("Accrual worker started",
+			zap.String("address", cfg.AccrualSystemAddress))
+	} else {
+		logger.Log.Warn("Accrual system address not configured, worker not started")
+	}
 
 	// создаем строку с сервером
 	fullPathServer := buildServerAddress(cfg.Server, cfg.Port)
