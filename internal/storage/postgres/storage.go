@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/IvanDolgov/go-musthave-diploma-tpl/internal/error/pgerrors"
@@ -317,32 +316,42 @@ func (s *PostgresStorage) GetOrdersByUserID(ctx context.Context, userID int) ([]
 
 // GetBalance возвращает баланс пользователя
 func (s *PostgresStorage) GetBalance(ctx context.Context, userID int) (*models.Balance, error) {
-	// Сначала создаем запись баланса, если ее нет
-	upsertQuery := `
-		INSERT INTO balances (user_id, current, withdrawn)
-		VALUES ($1, 0, 0)
-		ON CONFLICT (user_id) DO NOTHING
-	`
-	_, _ = s.db.ExecContext(ctx, upsertQuery, userID)
-
+	// Используем CTE для гарантированного получения баланса
 	query := `
-		SELECT current, withdrawn
-		FROM balances
-		WHERE user_id = $1
-	`
+        WITH upsert_balance AS (
+            INSERT INTO balances (user_id, current, withdrawn)
+            VALUES ($1, 0, 0)
+            ON CONFLICT (user_id) DO NOTHING
+            RETURNING user_id, current, withdrawn
+        )
+        SELECT user_id, current, withdrawn
+        FROM upsert_balance
+        UNION ALL
+        SELECT user_id, current, withdrawn
+        FROM balances
+        WHERE user_id = $1
+        AND NOT EXISTS (SELECT 1 FROM upsert_balance)
+        LIMIT 1
+    `
 
 	var balance models.Balance
 	balance.UserID = userID
 
 	var current, withdrawn sql.NullFloat64
 	err := s.db.QueryRowContext(ctx, query, userID).Scan(
+		&balance.UserID,
 		&current,
 		&withdrawn,
 	)
 
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return &balance, nil
+			// Возвращаем нулевой баланс, если пользователь существует
+			return &models.Balance{
+				UserID:    userID,
+				Current:   0,
+				Withdrawn: 0,
+			}, nil
 		}
 		return nil, fmt.Errorf("failed to get balance: %w", err)
 	}
@@ -372,19 +381,25 @@ func (s *PostgresStorage) AddAccrualToBalance(ctx context.Context, userID int, a
 	}
 	defer tx.Rollback()
 
-	// Конвертируем accrual в decimal строку
-	accrualStr := strconv.FormatFloat(accrual, 'f', 2, 64)
-
-	s.logger.Debug("Updating balance",
-		zap.Int("user_id", userID),
-		zap.String("accrual_str", accrualStr))
+	// Убедимся, что запись баланса существует
+	_, err = tx.ExecContext(ctx, `
+        INSERT INTO balances (user_id, current, withdrawn)
+        VALUES ($1, 0, 0)
+        ON CONFLICT (user_id) DO NOTHING
+    `, userID)
+	if err != nil {
+		s.logger.Error("Failed to ensure balance record exists",
+			zap.Int("user_id", userID),
+			zap.Error(err))
+		return fmt.Errorf("failed to ensure balance record: %w", err)
+	}
 
 	// Обновляем баланс (добавляем к current)
 	result, err := tx.ExecContext(ctx, `
-		UPDATE balances
-		SET current = current + $1::DECIMAL, updated_at = CURRENT_TIMESTAMP
-		WHERE user_id = $2
-	`, accrualStr, userID)
+        UPDATE balances
+        SET current = current + $1, updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = $2
+    `, accrual, userID)
 
 	if err != nil {
 		s.logger.Error("Failed to update balance",
@@ -400,15 +415,12 @@ func (s *PostgresStorage) AddAccrualToBalance(ctx context.Context, userID int, a
 
 	// Создаем транзакцию (положительная сумма - приход)
 	referenceID := fmt.Sprintf("accrual_%d_%d", userID, time.Now().UnixNano())
-	s.logger.Debug("Creating transaction",
-		zap.Int("user_id", userID),
-		zap.String("reference_id", referenceID))
 
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO transactions (
-			user_id, type, amount, description, reference_id, status, processed_at
-		) VALUES ($1, 'ACCRUAL', $2, $3, $4, 'COMPLETED', CURRENT_TIMESTAMP)
-	`, userID, accrualStr, "Accrual from order processing", referenceID)
+        INSERT INTO transactions (
+            user_id, type, amount, description, reference_id, status, processed_at
+        ) VALUES ($1, 'ACCRUAL', $2, $3, $4, 'COMPLETED', CURRENT_TIMESTAMP)
+    `, userID, accrual, "Accrual from order processing", referenceID)
 
 	if err != nil {
 		s.logger.Error("Failed to create transaction",
@@ -442,19 +454,24 @@ func (s *PostgresStorage) CreateWithdrawal(ctx context.Context, userID int, orde
 	}
 	defer tx.Rollback()
 
-	// Конвертируем сумму в decimal строку
-	sumStr := strconv.FormatFloat(sum, 'f', 2, 64)
+	// Убедимся, что запись баланса существует
+	_, err = tx.ExecContext(ctx, `
+        INSERT INTO balances (user_id, current, withdrawn)
+        VALUES ($1, 0, 0)
+        ON CONFLICT (user_id) DO NOTHING
+    `, userID)
+	if err != nil {
+		return fmt.Errorf("failed to ensure balance record: %w", err)
+	}
 
 	// Проверяем, достаточно ли средств (current >= sum)
-	var currentBalance string
+	var currentBalance float64
 	err = tx.QueryRowContext(ctx, "SELECT current FROM balances WHERE user_id = $1 FOR UPDATE", userID).Scan(&currentBalance)
 	if err != nil {
 		return fmt.Errorf("failed to get balance for update: %w", err)
 	}
 
-	// Проверяем через decimal сравнение
-	currentFloat, _ := strconv.ParseFloat(currentBalance, 64)
-	if currentFloat < sum {
+	if currentBalance < sum {
 		return fmt.Errorf("insufficient funds")
 	}
 
@@ -467,9 +484,9 @@ func (s *PostgresStorage) CreateWithdrawal(ctx context.Context, userID int, orde
 
 	// Создаем запись о списании
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO withdrawals (user_id, order_number, sum)
-		VALUES ($1, $2, $3)
-	`, userID, orderNumber, sumStr)
+        INSERT INTO withdrawals (user_id, order_number, sum)
+        VALUES ($1, $2, $3)
+    `, userID, orderNumber, sum)
 
 	if err != nil {
 		return fmt.Errorf("failed to create withdrawal: %w", err)
@@ -477,12 +494,12 @@ func (s *PostgresStorage) CreateWithdrawal(ctx context.Context, userID int, orde
 
 	// Обновляем баланс: уменьшаем current, увеличиваем withdrawn
 	_, err = tx.ExecContext(ctx, `
-		UPDATE balances
-		SET current = current - $1::DECIMAL, 
-		    withdrawn = withdrawn + $1::DECIMAL, 
-		    updated_at = CURRENT_TIMESTAMP
-		WHERE user_id = $2
-	`, sumStr, userID)
+        UPDATE balances
+        SET current = current - $1, 
+            withdrawn = withdrawn + $1, 
+            updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = $2
+    `, sum, userID)
 
 	if err != nil {
 		return fmt.Errorf("failed to update balance: %w", err)
@@ -490,12 +507,12 @@ func (s *PostgresStorage) CreateWithdrawal(ctx context.Context, userID int, orde
 
 	// Создаем транзакцию (отрицательная сумма - расход)
 	referenceID := fmt.Sprintf("withdraw_%s_%d", orderNumber, time.Now().UnixNano())
-	negativeSum := "-" + sumStr
+	negativeSum := -sum
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO transactions (
-			user_id, type, amount, description, order_number, reference_id, status, processed_at
-		) VALUES ($1, 'WITHDRAW', $2, $3, $4, $5, 'COMPLETED', CURRENT_TIMESTAMP)
-	`, userID, negativeSum, "Withdrawal for order payment", orderNumber, referenceID)
+        INSERT INTO transactions (
+            user_id, type, amount, description, order_number, reference_id, status, processed_at
+        ) VALUES ($1, 'WITHDRAW', $2, $3, $4, $5, 'COMPLETED', CURRENT_TIMESTAMP)
+    `, userID, negativeSum, "Withdrawal for order payment", orderNumber, referenceID)
 
 	if err != nil {
 		return fmt.Errorf("failed to create transaction: %w", err)

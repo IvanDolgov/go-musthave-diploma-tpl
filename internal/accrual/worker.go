@@ -140,6 +140,14 @@ func (w *Worker) processSingleOrder(ctx context.Context, order models.Order) {
 		return
 	}
 
+	// Проверяем, изменился ли статус
+	if order.Status == accrualResp.Status &&
+		(order.Accrual != nil && accrualResp.Accrual != nil && *order.Accrual == *accrualResp.Accrual) {
+		w.logger.Debug("Order status unchanged, skipping",
+			zap.String("order_number", order.Number))
+		return
+	}
+
 	// Обновляем статус заказа
 	err = w.storage.UpdateOrderAccrual(ctx, order.Number, accrualResp.Status, accrualResp.Accrual)
 	if err != nil {
